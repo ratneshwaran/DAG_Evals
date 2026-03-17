@@ -44,9 +44,9 @@ def roc_auc(in_scores, out_scores):
         np.zeros(len(in_scores)),
         np.ones(len(out_scores)),
     ])
-    # Negate scores so that lower FuDGE → higher "confidence" in-task
+    # Higher FuDGE → more likely out-of-task (label=1), no negation needed
     try:
-        return roc_auc_score(labels, -scores)
+        return roc_auc_score(labels, scores)
     except Exception:
         return float("nan")
 
