@@ -103,16 +103,13 @@ def _load_star_local(data_dir: str, domain_filter: Optional[List[str]] = None) -
     print(f"[data_loader] Loaded {len(records)} raw STAR files from {dialogues_dir}")
 
     if domain_filter:
-        # Filter: keep records that have at least one utter event in the target domain
+        # Domain lives in Scenario['Domains'] as a list, e.g. ['bank'] or ['hotel']
         canonical_filter = {DOMAIN_MAP.get(d.lower(), d.lower()) for d in domain_filter}
         filtered = []
         for rec in records:
-            domains_in_rec = {
-                DOMAIN_MAP.get(ev.get("domain", "").lower(), ev.get("domain", "").lower())
-                for ev in rec.get("Events", [])
-                if ev.get("type") == "utter"
-            }
-            if domains_in_rec & canonical_filter:
+            raw_domains = [d for d in rec.get("Scenario", {}).get("Domains", []) if d]
+            canonical_domains = {DOMAIN_MAP.get(d.lower(), d.lower()) for d in raw_domains}
+            if canonical_domains & canonical_filter:
                 filtered.append(rec)
         print(f"[data_loader] After domain filter {domain_filter}: {len(filtered)} records")
         records = filtered
@@ -126,45 +123,55 @@ def _load_star_local(data_dir: str, domain_filter: Optional[List[str]] = None) -
 
 def _parse_star_record(record: dict) -> List[Tuple[str, Dialogue, List[str]]]:
     """
-    Parse one STAR dialogue file into a list of (domain, dialogue, intents).
+    Parse one real RasaHQ/STAR dialogue file.
 
-    A single file may span multiple domains (multi-domain dialogues).
-    We split by domain and return one entry per domain found.
+    Real STAR field names:
+      - Action  (not 'type'):      'utter' | 'pick_suggestion' | 'request_suggestions' | ...
+      - Agent   (not 'actor'):     'User' | 'Wizard' | 'UserGuide' | 'KnowledgeBase'
+      - Text    (not 'utterance'): the spoken text
+      - ActionLabel:               intent label on Wizard pick_suggestion events
 
-    Returns: [(canonical_domain, dialogue, intent_list), ...]
+    Domain is in Scenario['Domains'] (list), NOT in individual events.
+
+    Returns: [(canonical_domain, dialogue, intent_list)]
+    One entry per record (single-domain or first domain if multi-domain).
     """
-    events = record.get("Events", [])
+    events  = record.get("Events", [])
+    domains = [d for d in record.get("Scenario", {}).get("Domains", []) if d]
+    if not domains:
+        return []
+    raw_domain = domains[0].lower()
+    domain = DOMAIN_MAP.get(raw_domain, raw_domain)
 
-    # Collect utter events only
-    domain_turns: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)
+    turns: List[Tuple[str, str, str]] = []  # (actor, text, intent)
 
     for ev in events:
-        if ev.get("type") != "utter":
+        action = ev.get("Action", "")
+        agent  = ev.get("Agent", "")
+        text   = str(ev.get("Text", "")).strip()
+
+        if agent not in ("User", "Wizard") or not text:
             continue
 
-        raw_actor = str(ev.get("actor", "")).strip()
-        if raw_actor not in ("User", "Wizard"):
-            continue
+        actor = "user" if agent == "User" else "agent"
 
-        actor = "user" if raw_actor == "User" else "agent"
-        utterance = str(ev.get("utterance", "")).strip()
-        intent = str(ev.get("intent", "")).strip()
-        raw_domain = str(ev.get("domain", "unknown")).lower().strip()
-        domain = DOMAIN_MAP.get(raw_domain, raw_domain)
+        if action == "utter":
+            # User utterances come as 'utter'; Wizard direct utterances too (rare)
+            intent = ""
+            turns.append((actor, text, intent))
 
-        if not utterance:
-            continue
+        elif action == "pick_suggestion" and agent == "Wizard":
+            # Wizard's actual spoken response — has an ActionLabel (intent)
+            intent = str(ev.get("ActionLabel", "")).strip()
+            turns.append((actor, text, intent))
 
-        domain_turns[domain].append((actor, utterance, intent))
+    if not turns:
+        return []
 
-    results = []
-    for domain, turns in domain_turns.items():
-        dialogue = [(actor, utt) for actor, utt, _ in turns]
-        intents  = [intent for _, _, intent in turns]
-        if dialogue:
-            results.append((domain, dialogue, intents))
+    dialogue = [(actor, text)   for actor, text, _      in turns]
+    intents  = [intent          for _,     _,    intent in turns]
 
-    return results
+    return [(domain, dialogue, intents)]
 
 
 # ---------------------------------------------------------------------------
