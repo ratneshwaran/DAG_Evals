@@ -19,14 +19,13 @@ Algorithm: efficient DFS with memoised DP columns (Algorithm 2 in paper).
 
 from __future__ import annotations
 
-import math
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import networkx as nx
 
 from .graph import DialogueFlow
-from .embeddings import encode, cosine_dist, intent_centroid, pairwise_cosine_dist
+from .embeddings import encode, cosine_dist, intent_centroid
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -145,10 +144,20 @@ def _fudge_efficient(
     dial: Dialogue,
     flow: DialogueFlow,
     variant: str = "min",
+    centroid_cache: Optional[Dict[str, np.ndarray]] = None,
+    utt_embs_cache: Optional[Dict[str, np.ndarray]] = None,
 ) -> float:
     """
     Compute the unnormalised minimum edit distance between `dial` and the
-    closest path in `flow` using a DFS with memoised DP columns.
+    closest path in `flow` using iterative relaxation (Bellman-Ford style).
+
+    Instead of DFS (exponential on dense/cyclic graphs), we propagate DP
+    columns one hop at a time for n+2 rounds.  Each round is O(E * n),
+    total O((n+2) * E * n) — tractable even for dense flows.
+
+    memo[node] stores the element-wise best (minimum) DP column seen at
+    that node across all paths of any length up to the current round.
+    The best alignment score is min(col[n]) over all nodes.
 
     Returns raw edit distance (float).
     """
@@ -161,79 +170,98 @@ def _fudge_efficient(
     # Pre-encode all dialogue utterances at once
     dial_embs = encode([utt for _, utt in dial])  # (n, D)
 
-    # Caches keyed by node_id
-    centroid_cache: Dict[str, np.ndarray] = {}
-    utt_embs_cache: Dict[str, np.ndarray] = {}
-
-    # memo[node_id] = best (element-wise min) DP column seen so far
-    memo: Dict[str, DPCol] = {}
+    # Caches keyed by node_id — shared across calls when passed in from avg_fudge
+    if centroid_cache is None:
+        centroid_cache = {}
+    if utt_embs_cache is None:
+        utt_embs_cache = {}
 
     # Initial column: cost of matching dialogue[0:i] with empty path
     # col[i] = i (delete all i dialogue turns)
     init_col = np.arange(n + 1, dtype=np.float64)
 
-    best_distance = _INF
+    # memo[node_id] = best DP column (element-wise min over all paths to node)
+    memo: Dict[str, DPCol] = {}
 
-    # Source nodes (real, not START sentinel)
-    sources = flow.source_nodes()
-
-    def _dfs(node_id: str, incoming_col: DPCol, path_len: int):
-        nonlocal best_distance
-
-        attr = graph.nodes[node_id]
+    # Seed memo from source nodes
+    for src in flow.source_nodes():
+        attr = graph.nodes[src]
         col = _extend_column(
-            incoming_col,
-            dial,
-            dial_embs,
-            node_id,
-            attr,
-            variant,
-            centroid_cache,
-            utt_embs_cache,
+            init_col, dial, dial_embs, src, attr, variant,
+            centroid_cache, utt_embs_cache,
         )
+        memo[src] = col.copy()
 
-        # Memoisation: if we've visited this node with a dominating column,
-        # prune. Otherwise update memo and continue.
-        if node_id in memo:
-            prev_best = memo[node_id]
-            if np.all(prev_best <= col):
-                # Previous visit dominated — prune this branch
-                return
-            # Element-wise min: keep the best from either visit
-            memo[node_id] = np.minimum(prev_best, col)
-        else:
-            memo[node_id] = col.copy()
+    # Iterative relaxation: propagate one hop per round for n+2 rounds.
+    # After k rounds memo captures the best alignment over paths of length ≤ k+1.
+    for _ in range(n + 2):
+        # Snapshot incoming columns so this round is a single-hop step.
+        snapshot = {nid: col.copy() for nid, col in memo.items()}
+        changed = False
 
-        # Candidate terminal: record best[n] (full dialogue consumed)
-        candidate = col[n]
-        if candidate < best_distance:
-            best_distance = candidate
+        for node_id, incoming_col in snapshot.items():
+            for nxt in graph.successors(node_id):
+                if nxt == DialogueFlow.END:
+                    continue
+                attr = graph.nodes[nxt]
+                new_col = _extend_column(
+                    incoming_col, dial, dial_embs, nxt, attr, variant,
+                    centroid_cache, utt_embs_cache,
+                )
+                if nxt in memo:
+                    if np.all(memo[nxt] <= new_col):
+                        continue  # no improvement at any position
+                    updated = np.minimum(memo[nxt], new_col)
+                    if not np.array_equal(updated, memo[nxt]):
+                        memo[nxt] = updated
+                        changed = True
+                else:
+                    memo[nxt] = new_col.copy()
+                    changed = True
 
-        # Recurse into successors (excluding END sentinel)
-        for nxt in graph.successors(node_id):
-            if nxt == DialogueFlow.END:
-                continue
-            _dfs(nxt, col, path_len + 1)
+        if not changed:
+            break  # converged early
 
-    for src in sources:
-        _dfs(src, init_col, 1)
-
-    return best_distance if best_distance != _INF else float(n)
+    if not memo:
+        return float(n)
+    return float(min(col[n] for col in memo.values()))
 
 
 # ---------------------------------------------------------------------------
 # Normalised FuDGE
 # ---------------------------------------------------------------------------
 
-def _path_lengths(flow: DialogueFlow, max_depth: int = 100) -> List[int]:
-    """Return list of lengths (node counts) of all paths in the flow."""
-    return [len(p) for p in flow.all_paths(max_depth=max_depth)]
+def _flow_max_path(flow: DialogueFlow) -> int:
+    """
+    Return an upper bound on the longest path length through the flow.
+
+    For sparse DAGs: enumerate paths (capped at 200) to get the true max.
+    For dense or cyclic flows (where enumeration is expensive): fall back to
+    the number of intent nodes as a proxy — this is O(1) and avoids the
+    exponential all_paths() call.
+
+    Density threshold: avg out-degree > 3 signals a dense/cyclic flow.
+    """
+    num_nodes = flow.num_nodes()
+    if num_nodes == 0:
+        return 1
+    num_edges = flow.graph.number_of_edges()
+    avg_out_degree = num_edges / max(num_nodes, 1)
+    if avg_out_degree > 3.0:
+        # Dense or cyclic flow — skip path enumeration
+        return num_nodes
+    # Sparse DAG: enumerate a sample of paths
+    path_lens = [len(p) for p in flow.all_paths(max_depth=50, max_paths=200)]
+    return max(path_lens) if path_lens else num_nodes
 
 
 def fudge(
     dialogue: Dialogue,
     flow: DialogueFlow,
     variant: str = "min",
+    _max_path: Optional[int] = None,
+    _centroid_cache: Optional[Dict[str, np.ndarray]] = None,
+    _utt_embs_cache: Optional[Dict[str, np.ndarray]] = None,
 ) -> float:
     """
     Compute normalised FuDGE score for a single dialogue against a flow.
@@ -241,22 +269,23 @@ def fudge(
     FuDGE = raw_edit_distance / max(|D|, |best_path|)
 
     Returns a float in [0, 1].
+
+    _max_path, _centroid_cache, _utt_embs_cache: pass from avg_fudge to share
+    expensive precomputations (path length, node embeddings) across dialogues.
     """
     if not dialogue:
         return 0.0
 
-    raw = _fudge_efficient(dialogue, flow, variant=variant)
+    raw = _fudge_efficient(
+        dialogue, flow, variant=variant,
+        centroid_cache=_centroid_cache,
+        utt_embs_cache=_utt_embs_cache,
+    )
 
-    # Approximate best-path length using closest path in flow
-    # For normalisation we use max(|D|, |flow_path|) over the best-matching path.
-    # We use the maximum path length as a conservative upper bound.
-    path_lens = _path_lengths(flow)
-    if path_lens:
-        max_path = max(path_lens)
-    else:
-        max_path = 1
+    if _max_path is None:
+        _max_path = _flow_max_path(flow)
 
-    denom = max(len(dialogue), max_path)
+    denom = max(len(dialogue), _max_path)
     if denom == 0:
         return 0.0
     return float(raw) / denom
@@ -269,10 +298,24 @@ def avg_fudge(
 ) -> float:
     """
     Average normalised FuDGE over a list of dialogues.
+
+    Precomputes once per flow: max-path length and node embedding caches.
+    Each node's utterances are encoded only once, not once per dialogue.
     """
     if not dialogues:
         return 0.0
-    scores = [fudge(d, flow, variant=variant) for d in dialogues]
+    max_path = _flow_max_path(flow)
+    centroid_cache: Dict[str, np.ndarray] = {}
+    utt_embs_cache: Dict[str, np.ndarray] = {}
+    scores = [
+        fudge(
+            d, flow, variant=variant,
+            _max_path=max_path,
+            _centroid_cache=centroid_cache,
+            _utt_embs_cache=utt_embs_cache,
+        )
+        for d in dialogues
+    ]
     return float(np.mean(scores))
 
 
@@ -289,8 +332,6 @@ def fudge_naive(
     Naively enumerate every path and compute Levenshtein distance.
     Only feasible for small DAGs. Useful for unit tests.
     """
-    from .graph import DialogueFlow as _DF
-
     graph = flow.graph
     n = len(dialogue)
 

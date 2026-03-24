@@ -19,7 +19,7 @@ import matplotlib.gridspec as gridspec
 from tqdm import tqdm
 
 from src.data_loader import load_star
-from src.fudge import fudge
+from src.fudge import fudge, _flow_max_path
 
 
 # ---------------------------------------------------------------------------
@@ -27,9 +27,18 @@ from src.fudge import fudge
 # ---------------------------------------------------------------------------
 
 def compute_scores(dialogues, flow, variant="min", desc=""):
+    """Score all dialogues sharing precomputed caches for speed."""
+    max_path = _flow_max_path(flow)
+    centroid_cache = {}
+    utt_embs_cache = {}
     scores = []
     for dial in tqdm(dialogues, desc=desc, leave=False):
-        scores.append(fudge(dial, flow, variant=variant))
+        scores.append(fudge(
+            dial, flow, variant=variant,
+            _max_path=max_path,
+            _centroid_cache=centroid_cache,
+            _utt_embs_cache=utt_embs_cache,
+        ))
     return np.array(scores)
 
 
@@ -47,7 +56,7 @@ def roc_auc(in_scores, out_scores):
     # Higher FuDGE → more likely out-of-task (label=1), no negation needed
     try:
         return roc_auc_score(labels, scores)
-    except Exception:
+    except ValueError:
         return float("nan")
 
 

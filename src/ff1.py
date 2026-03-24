@@ -59,6 +59,9 @@ def ff1(
     -------
     FF1 in [0, 1]  (higher is better)
     """
+    if not dialogues:
+        return 0.0
+
     total_utterances = sum(len(d) for d in dialogues)
 
     c = 1.0 - complexity(flow, total_utterances)

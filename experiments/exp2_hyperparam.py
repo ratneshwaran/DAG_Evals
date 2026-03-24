@@ -79,6 +79,9 @@ def discover_flow_kmeans(
         for j, (actor, utt) in enumerate(dial):
             cluster_positions[labels[pos]].append(j / max(len(dial) - 1, 1))
             pos += 1
+    assert pos == len(all_utts), (
+        f"Utterance count mismatch: second pass saw {pos}, first pass saw {len(all_utts)}"
+    )
 
     cluster_order = sorted(
         range(k_actual),

@@ -7,6 +7,7 @@ Edges represent valid transitions between intents.
 
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Iterator
+import itertools
 import networkx as nx
 
 
@@ -66,10 +67,14 @@ class DialogueFlow:
 
     def set_start(self, node_id: str) -> None:
         """Connect the START sentinel to the given node."""
+        if node_id not in self.graph:
+            raise KeyError(f"Cannot set start: node {node_id!r} not in graph")
         self.graph.add_edge(self.START, node_id)
 
     def set_end(self, node_id: str) -> None:
         """Connect the given node to the END sentinel."""
+        if node_id not in self.graph:
+            raise KeyError(f"Cannot set end: node {node_id!r} not in graph")
         self.graph.add_edge(node_id, self.END)
 
     # ------------------------------------------------------------------
@@ -88,12 +93,26 @@ class DialogueFlow:
         ]
 
     def source_nodes(self) -> List[str]:
-        """Nodes with no real predecessors (first turns in conversations)."""
+        """
+        Nodes that begin conversations.
+
+        Includes any node reachable directly from the START sentinel
+        (set explicitly via set_start()), plus nodes with no incoming
+        edges from other intent nodes (for DAG flows without sentinels).
+        For cyclic real-world flows, nodes connected from START are the
+        reliable anchor.
+        """
+        # Primary: nodes START explicitly points to
+        from_start = [
+            n for n in self.graph.successors(self.START)
+            if n != self.END
+        ]
+        if from_start:
+            return from_start
+        # Fallback: nodes with no incoming intent-node edges
         return [
-            n
-            for n in self.intent_nodes()
-            if all(p in (self.START,) for p in self.graph.predecessors(n))
-            or self.graph.in_degree(n) == 0
+            n for n in self.intent_nodes()
+            if self.graph.in_degree(n) == 0
         ]
 
     def sink_nodes(self) -> List[str]:
@@ -110,13 +129,14 @@ class DialogueFlow:
     # ------------------------------------------------------------------
 
     def all_paths(
-        self, max_depth: int = 50
+        self, max_depth: int = 50, max_paths: int = 500
     ) -> Iterator[List[str]]:
         """
         DFS enumeration of all simple paths through the DAG
         (excluding START/END sentinels).
 
-        Yields lists of real node IDs.
+        Yields lists of real node IDs. Stops after max_paths to avoid
+        exponential blowup on dense/cyclic flows.
         """
         sources = self.source_nodes()
         sinks = set(self.sink_nodes())
@@ -137,8 +157,11 @@ class DialogueFlow:
                 if nxt not in path:  # avoid cycles (safety)
                     yield from _dfs(nxt, path, depth + 1)
 
-        for src in sources:
-            yield from _dfs(src, [], 0)
+        def _all_from_sources():
+            for src in sources:
+                yield from _dfs(src, [], 0)
+
+        yield from itertools.islice(_all_from_sources(), max_paths)
 
     def num_nodes(self) -> int:
         return len(self.intent_nodes())

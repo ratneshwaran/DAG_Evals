@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -64,6 +65,9 @@ DOMAIN_MAP = {
 
 DEFAULT_DOMAINS = ["banking", "hotel"]
 
+# Number of dialogues per split (in-task / out-of-task) used in experiments
+SPLIT_SIZE = 50
+
 
 # ---------------------------------------------------------------------------
 # Real STAR loader (local directory of JSON files)
@@ -84,6 +88,7 @@ def _load_star_local(data_dir: str, domain_filter: Optional[List[str]] = None) -
             f"  git clone https://github.com/RasaHQ/STAR {data_dir}"
         )
 
+
     files = sorted(
         f for f in os.listdir(dialogues_dir) if f.endswith(".json")
     )
@@ -97,7 +102,8 @@ def _load_star_local(data_dir: str, domain_filter: Optional[List[str]] = None) -
             with open(path, encoding="utf-8") as f:
                 rec = json.load(f)
             records.append(rec)
-        except Exception:
+        except (json.JSONDecodeError, OSError) as e:
+            warnings.warn(f"[data_loader] Skipping {fname}: {e}")
             continue
 
     print(f"[data_loader] Loaded {len(records)} raw STAR files from {dialogues_dir}")
@@ -195,9 +201,15 @@ def _build_flow_from_annotations(
         node_utts:   Dict[str, List[str]] = defaultdict(list)
         node_actors: Dict[str, str] = {}
         edges: set = set()
+        first_nodes: set = set()   # intents that open dialogues
+        last_nodes:  set = set()   # intents that close dialogues
 
         for dial, intents in zip(dialogues, intent_annotations):
             prev = None
+            active = [i for i in intents if i]  # strip blanks
+            if active:
+                first_nodes.add(active[0])
+                last_nodes.add(active[-1])
             for (actor, utt), intent in zip(dial, intents):
                 if not intent:
                     continue
@@ -213,6 +225,15 @@ def _build_flow_from_annotations(
         for src, dst in edges:
             if src in flow.graph and dst in flow.graph:
                 flow.add_transition(src, dst)
+
+        # Wire sentinels using observed first/last intents
+        for n in first_nodes:
+            if n in flow.graph:
+                flow.set_start(n)
+        for n in last_nodes:
+            if n in flow.graph:
+                flow.set_end(n)
+        return flow   # skip the generic sentinel wiring below
 
     else:
         max_turns = max((len(d) for d in dialogues), default=0)
@@ -321,21 +342,21 @@ def _process_real_records(
         flow = _build_flow_from_annotations(
             domain,
             diags,
-            intent_annotations=intents if any(intents) else None,
+            intent_annotations=intents if any(any(i) for i in intents) else None,
         )
 
         # Out-of-task: dialogues from all other domains
         out_of_task: List[Dialogue] = []
         for other in all_domains:
             if other != domain:
-                out_of_task.extend(domain_dialogues[other][:50])
+                out_of_task.extend(domain_dialogues[other][:SPLIT_SIZE])
 
         result[domain] = {
             "dialogues": diags,
             "flow": flow,
             "split": {
-                "in_task":     diags[:50],
-                "out_of_task": out_of_task[:50],
+                "in_task":     diags[:SPLIT_SIZE],
+                "out_of_task": out_of_task[:SPLIT_SIZE],
             },
         }
 

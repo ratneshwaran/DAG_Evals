@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"/c/Users/ratne/Downloads/DAG_Evals\" ls-tree -r --name-only HEAD)"
+    ]
+  }
+}
