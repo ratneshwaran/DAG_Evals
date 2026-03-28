@@ -92,7 +92,7 @@ def _print_breakdown(bd: dict):
 def _plot_comparison(results: dict, save_fig: bool):
     domains = list(results.keys())
     metrics = ["ff1", "faithfulness", "compactness", "avg_fudge"]
-    metric_labels = ["FF1", "Faithfulness", "Compactness", "Avg FuDGE"]
+    metric_labels = ["FF1", "Faithfulness", "Compactness\n(controlled — same k)", "Avg FuDGE"]
 
     n_metrics = len(metrics)
     n_domains = len(domains)

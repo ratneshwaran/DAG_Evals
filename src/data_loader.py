@@ -73,12 +73,19 @@ SPLIT_SIZE = 50
 # Real STAR loader (local directory of JSON files)
 # ---------------------------------------------------------------------------
 
-def _load_star_local(data_dir: str, domain_filter: Optional[List[str]] = None) -> List[dict]:
+def _load_star_local(
+    data_dir: str,
+    domain_filter: Optional[List[str]] = None,
+    task_filter: Optional[List[str]] = None,
+) -> List[dict]:
     """
     Load STAR JSON files from a local directory.
 
     Expects files like: data/star/dialogues/1.json, 2.json, ...
     (cloned from https://github.com/RasaHQ/STAR)
+
+    task_filter: if provided, only keep records whose WizardCapabilities Task
+                 matches one of the listed task names (e.g. ["bank_fraud_report"]).
     """
     dialogues_dir = os.path.join(data_dir, "dialogues")
     if not os.path.isdir(dialogues_dir):
@@ -118,6 +125,17 @@ def _load_star_local(data_dir: str, domain_filter: Optional[List[str]] = None) -
             if canonical_domains & canonical_filter:
                 filtered.append(rec)
         print(f"[data_loader] After domain filter {domain_filter}: {len(filtered)} records")
+        records = filtered
+
+    if task_filter:
+        task_set = {t.lower() for t in task_filter}
+        filtered = []
+        for rec in records:
+            caps = rec.get("Scenario", {}).get("WizardCapabilities", [])
+            rec_tasks = {c.get("Task", "").lower() for c in caps if c.get("Task")}
+            if rec_tasks & task_set:
+                filtered.append(rec)
+        print(f"[data_loader] After task filter {task_filter}: {len(filtered)} records")
         records = filtered
 
     return records
@@ -261,6 +279,7 @@ def load_star(
     domains: Optional[List[str]] = None,
     max_dialogues_per_domain: Optional[int] = None,
     data_dir: Optional[str] = None,
+    task_filter: Optional[List[str]] = None,
 ) -> Dict[str, dict]:
     """
     Load STAR dataset and return a dict keyed by domain.
@@ -268,6 +287,10 @@ def load_star(
     Priority:
       1. Local STAR clone at data_dir (or data/star/ by default)
       2. Synthetic fallback (for offline/testing use)
+
+    task_filter: optional list of STAR task names to restrict loading to a
+                 specific task (e.g. ["bank_fraud_report", "hotel_book"]).
+                 Use this to match the paper's single-task experiment setup.
 
     Returns:
       {
@@ -291,10 +314,12 @@ def load_star(
         )
 
     print(f"[data_loader] Loading STAR for domains: {domains}")
+    if task_filter:
+        print(f"[data_loader] Task filter: {task_filter}")
 
     # Try real STAR data first
     try:
-        records = _load_star_local(data_dir, domain_filter=domains)
+        records = _load_star_local(data_dir, domain_filter=domains, task_filter=task_filter)
         return _process_real_records(records, domains, max_dialogues_per_domain)
     except FileNotFoundError as e:
         print(f"[data_loader] Real STAR not found: {e}")
