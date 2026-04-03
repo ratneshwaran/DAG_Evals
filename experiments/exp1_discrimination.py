@@ -1,5 +1,6 @@
 """
 Experiment 1 — FuDGE discriminates in-task vs out-of-task dialogues
+Goal: Verify that FuDGE can distinguish dialogues that are in-task (fit the flow) from those that are out-of-task (do not fit the flow).
 
 For each domain (Bank, Hotel):
   - Compute FuDGE(d, flow) for 50 in-task dialogues

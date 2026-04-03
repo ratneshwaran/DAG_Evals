@@ -5,7 +5,7 @@ Compare FF1 scores for:
   - Supervised flow:   built from annotated intents (ground-truth)
   - Unsupervised flow: built from k-means clustering on utterance embeddings
 
-We evaluate both on Bank and Hotel domains from STAR.
+We evaluate both on Bank and Hotel domains from STAR
 """
 
 import sys

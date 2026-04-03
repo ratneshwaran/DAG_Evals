@@ -158,4 +158,4 @@ Our hotel supervised score (FF1=0.843, FuDGE=0.260) closely matches the paper's 
 | Compactness decreases monotonically with k | ❌ Not yet replicated — path-pruning caps nodes at N_BASE_CLUSTERS=10; fix pending |
 | FF1 peaks at intermediate k (inverted-U shape) | ❌ Not yet replicated — compactness too flat; fix pending |
 | Best FF1 scores in a plausible range | ✅ Confirmed (0.654–0.680 unsupervised, between paper's 0.75 sup and 0.57 unsup) |
-| Supervised > unsupervised FF1 | ✅ Confirmed (banking: 0.774 > 0.746, hotel: 0.843 > 0.804) |
+| Supervised > unsupervised FF1 | ✅ Confirmed (banking: 0.774 > 0.746, hotel: 0.843 > 0.804)  |

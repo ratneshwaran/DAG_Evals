@@ -5,6 +5,7 @@ We vary k (number of retained paths) using the path-pruning approach from
 the paper (ALG2): build a full DAG from the corpus, rank all observed dialogue
 paths by frequency, then keep only the top-k paths and trim the flow.
 
+
 As k grows:
   - Faithfulness increases (more patterns covered) — but plateaus as marginal
     paths are rare and add little coverage
