@@ -49,11 +49,23 @@ def _sub_cost(
     actor: str,
     centroid_cache: Dict[str, np.ndarray],
     utt_embs_cache: Dict[str, np.ndarray],
+    all_centroids: Optional[Dict[str, np.ndarray]] = None,
+    all_actors: Optional[Dict[str, str]] = None,
+    alpha: float = 0.5,
 ) -> float:
     """
     Cost of substituting utterance `utt` (actor `actor`) with intent `node_id`.
 
-    Returns ∞ if actor mismatch, otherwise a cosine distance in [0, 1].
+    Implements the paper's Equation 8:
+        costsub(Br, u) = alpha * (d1(Br, u) + d2(Br, B*))
+    where:
+        d1 = intent-utterance distance (min or centroid variant)
+        B* = nearest intent to u (same actor) in the full intent set
+        d2 = cosine distance between centroids of Br and B*
+        alpha = 0.5 (keeps cost in [0, 1])
+
+    If all_centroids/all_actors are None, falls back to d1-only (no d2 term).
+    Returns inf if actor mismatch.
     """
     node_actor = node_attr.get("actor")
     if node_actor is not None and node_actor != actor:
@@ -61,24 +73,49 @@ def _sub_cost(
 
     node_utts = node_attr.get("utterances", [])
     if not node_utts:
-        # No reference utterances → maximum cost (but not ∞, actor matched)
         return 1.0
 
+    # d1: intent-utterance distance
     if variant == "centroid":
         if node_id not in centroid_cache:
             centroid_cache[node_id] = intent_centroid(node_utts)
         cent = centroid_cache[node_id]
-        return cosine_dist(utt_emb, cent)
-
+        d1 = cosine_dist(utt_emb, cent)
     else:  # "min"
         if node_id not in utt_embs_cache:
             utt_embs_cache[node_id] = encode(node_utts)
         node_embs = utt_embs_cache[node_id]
-        # utt_emb shape (D,), node_embs shape (M, D)
         sims = node_embs @ utt_emb  # (M,)
         sims = np.clip(sims, -1.0, 1.0)
         dists = (1.0 - sims) / 2.0
-        return float(dists.min())
+        d1 = float(dists.min())
+
+    # d2: intent-intent distance between Br and B* (nearest intent to u)
+    if all_centroids is None or all_actors is None:
+        return d1
+
+    # Ensure Br centroid is cached
+    if node_id not in centroid_cache:
+        centroid_cache[node_id] = intent_centroid(node_utts)
+    br_cent = centroid_cache[node_id]
+
+    # Find B* = argmin cosine_dist(centroid_Bs, utt_emb) where Bs.actor == actor
+    best_d2 = 1.0
+    for other_id, other_cent in all_centroids.items():
+        if all_actors.get(other_id) != actor:
+            continue
+        # Distance from u to this intent centroid
+        sim_u = float(np.dot(utt_emb, other_cent))
+        sim_u = max(-1.0, min(1.0, sim_u))
+        dist_u = (1.0 - sim_u) / 2.0
+        if dist_u < best_d2:
+            best_d2 = dist_u
+            best_cent = other_cent
+
+    # d2 = cosine_dist(Br centroid, B* centroid)
+    d2 = cosine_dist(br_cent, best_cent) if best_d2 < 1.0 else 0.0
+
+    return alpha * (d1 + d2)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +131,9 @@ def _extend_column(
     variant: str,
     centroid_cache: Dict[str, np.ndarray],
     utt_embs_cache: Dict[str, np.ndarray],
+    all_centroids: Optional[Dict[str, np.ndarray]] = None,
+    all_actors: Optional[Dict[str, str]] = None,
+    alpha: float = 0.5,
 ) -> DPCol:
     """
     Given the DP column `prev_col` (costs after consuming dialogue[0:i] and
@@ -123,6 +163,9 @@ def _extend_column(
             actor_i,
             centroid_cache,
             utt_embs_cache,
+            all_centroids,
+            all_actors,
+            alpha,
         )
         # Clamp ∞ substitution to a large finite penalty for DP stability
         sub_cost = sub if sub != _INF else n + 1.0
@@ -146,6 +189,7 @@ def _fudge_efficient(
     variant: str = "min",
     centroid_cache: Optional[Dict[str, np.ndarray]] = None,
     utt_embs_cache: Optional[Dict[str, np.ndarray]] = None,
+    alpha: float = 0.5,
 ) -> float:
     """
     Compute the unnormalised minimum edit distance between `dial` and the
@@ -176,6 +220,16 @@ def _fudge_efficient(
     if utt_embs_cache is None:
         utt_embs_cache = {}
 
+    # Precompute all intent centroids and actor map for the d2 term (Eq. 8)
+    all_centroids: Dict[str, np.ndarray] = {}
+    all_actors: Dict[str, str] = {}
+    for nid in flow.intent_nodes():
+        attr = graph.nodes[nid]
+        all_actors[nid] = attr.get("actor", "agent")
+        if nid not in centroid_cache:
+            centroid_cache[nid] = intent_centroid(attr.get("utterances", []))
+        all_centroids[nid] = centroid_cache[nid]
+
     # Initial column: cost of matching dialogue[0:i] with empty path
     # col[i] = i (delete all i dialogue turns)
     init_col = np.arange(n + 1, dtype=np.float64)
@@ -189,6 +243,7 @@ def _fudge_efficient(
         col = _extend_column(
             init_col, dial, dial_embs, src, attr, variant,
             centroid_cache, utt_embs_cache,
+            all_centroids, all_actors, alpha,
         )
         memo[src] = col.copy()
 
@@ -207,6 +262,7 @@ def _fudge_efficient(
                 new_col = _extend_column(
                     incoming_col, dial, dial_embs, nxt, attr, variant,
                     centroid_cache, utt_embs_cache,
+                    all_centroids, all_actors, alpha,
                 )
                 if nxt in memo:
                     if np.all(memo[nxt] <= new_col):
@@ -259,6 +315,7 @@ def fudge(
     dialogue: Dialogue,
     flow: DialogueFlow,
     variant: str = "min",
+    alpha: float = 0.5,
     _max_path: Optional[int] = None,
     _centroid_cache: Optional[Dict[str, np.ndarray]] = None,
     _utt_embs_cache: Optional[Dict[str, np.ndarray]] = None,
@@ -270,6 +327,7 @@ def fudge(
 
     Returns a float in [0, 1].
 
+    alpha: weight for the two-part substitution cost (paper Eq. 8, default 0.5).
     _max_path, _centroid_cache, _utt_embs_cache: pass from avg_fudge to share
     expensive precomputations (path length, node embeddings) across dialogues.
     """
@@ -280,6 +338,7 @@ def fudge(
         dialogue, flow, variant=variant,
         centroid_cache=_centroid_cache,
         utt_embs_cache=_utt_embs_cache,
+        alpha=alpha,
     )
 
     if _max_path is None:
@@ -295,6 +354,7 @@ def avg_fudge(
     dialogues: List[Dialogue],
     flow: DialogueFlow,
     variant: str = "min",
+    alpha: float = 0.5,
 ) -> float:
     """
     Average normalised FuDGE over a list of dialogues.
@@ -309,7 +369,7 @@ def avg_fudge(
     utt_embs_cache: Dict[str, np.ndarray] = {}
     scores = [
         fudge(
-            d, flow, variant=variant,
+            d, flow, variant=variant, alpha=alpha,
             _max_path=max_path,
             _centroid_cache=centroid_cache,
             _utt_embs_cache=utt_embs_cache,
@@ -327,6 +387,7 @@ def fudge_naive(
     dialogue: Dialogue,
     flow: DialogueFlow,
     variant: str = "min",
+    alpha: float = 0.5,
 ) -> float:
     """
     Naively enumerate every path and compute Levenshtein distance.
@@ -341,6 +402,15 @@ def fudge_naive(
     dial_embs = encode([utt for _, utt in dialogue])
     centroid_cache: Dict[str, np.ndarray] = {}
     utt_embs_cache: Dict[str, np.ndarray] = {}
+
+    # Precompute all intent centroids for d2 term
+    all_centroids: Dict[str, np.ndarray] = {}
+    all_actors: Dict[str, str] = {}
+    for nid in flow.intent_nodes():
+        attr = graph.nodes[nid]
+        all_actors[nid] = attr.get("actor", "agent")
+        centroid_cache[nid] = intent_centroid(attr.get("utterances", []))
+        all_centroids[nid] = centroid_cache[nid]
 
     best = _INF
 
@@ -365,6 +435,9 @@ def fudge_naive(
                     actor_i,
                     centroid_cache,
                     utt_embs_cache,
+                    all_centroids,
+                    all_actors,
+                    alpha,
                 )
                 sub_cost = sub if sub != _INF else n + 1.0
                 dp[i, j] = min(
