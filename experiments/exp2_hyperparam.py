@@ -1,15 +1,13 @@
 """
-Experiment 2 — FF1 for hyperparameter selection (path-pruning, ALG2)
+Experiment 2 — FF1 for hyperparameter selection (k = number of intent nodes)
 
-We vary k (number of retained paths) using the path-pruning approach from
-the paper (ALG2): build a full DAG from the corpus, rank all observed dialogue
-paths by frequency, then keep only the top-k paths and trim the flow.
-
+We vary k (number of intent clusters / nodes) using k-means clustering.
+This directly mirrors the paper's Figure 3 setup where k controls how many
+intent nodes the discovered flow contains.
 
 As k grows:
-  - Faithfulness increases (more patterns covered) — but plateaus as marginal
-    paths are rare and add little coverage
-  - Compactness decreases (more nodes/edges needed to represent k paths)
+  - Faithfulness increases (finer-grained intents cover more dialogue patterns)
+  - Compactness decreases (more nodes → higher complexity = nodes / utterances)
   - FF1 peaks at the "right" k that balances coverage vs complexity
 
 This produces the inverted-U shape described in the paper (Figure 3).
@@ -262,10 +260,11 @@ def run_experiment(
     domains=None,
     k_values=None,
     tasks=None,
-    n_base_clusters=N_BASE_CLUSTERS,
     save_fig=True,
 ):
     """
+    Sweep k (number of intent nodes) via k-means clustering.
+
     tasks: dict mapping domain → STAR task name, e.g.
            {"banking": "bank_fraud_report", "hotel": "hotel_book"}.
            Defaults to DEFAULT_TASKS to match the paper's single-task setup.
@@ -278,14 +277,13 @@ def run_experiment(
 
     print("=" * 60)
     print("Experiment 2: FF1 for Hyperparameter (k) Selection")
-    print("Method: path-pruning (ALG2-inspired)")
+    print("Method: k-means (k = number of intent nodes)")
     if tasks:
         print(f"Task filter: {tasks}")
     print("=" * 60)
 
     # Cap at 40 dialogues to match the paper's utterance scale (~600 total):
-    # the paper used ~150 short Finance dialogues (~4 turns each).
-    # STAR dialogues average ~16 turns, so 40 × 16 ≈ 640 utterances ≈ paper scale.
+    # STAR dialogues average ~16 turns, so 40 × 16 ≈ 640 utterances.
     DIAL_CAP = 40
     data = {}
     for domain in domains:
@@ -308,33 +306,31 @@ def run_experiment(
     for ax, (domain, info) in zip(axes, data.items()):
         task_label = tasks.get(domain, domain) if tasks else domain
         dialogues  = info["dialogues"]
-        print(f"\nDomain: {domain} / task: {task_label} ({len(dialogues)} dialogues)")
+        total_utts = sum(len(d) for d in dialogues)
+        print(f"\nDomain: {domain} / task: {task_label}")
+        print(f"  {len(dialogues)} dialogues, {total_utts} total utterances")
 
-        # Pre-compute full DAG and ranked paths (done ONCE per domain)
-        print(f"  Building full DAG ({n_base_clusters} clusters)…")
-        base_info   = build_path_pruning_base(dialogues, n_clusters=n_base_clusters)
-        total_paths = base_info["total_paths"]
-        print(f"  Unique dialogue paths found: {total_paths}")
-
-        if total_paths == 0:
-            print("  No paths found — skipping domain.")
-            continue
-
-        # Sweep k from 1 to total_paths (adaptive range)
+        # Sweep k from 2 up to a reasonable fraction of total utterances.
+        # Paper sweeps to ~60 on ~600 utterances. We scale proportionally.
+        k_max = max(10, min(80, total_utts // 8))
         if k_values is None:
-            sweep = list(range(1, total_paths + 1))
+            sweep = list(range(2, k_max + 1))
         else:
-            sweep = [k for k in k_values if 1 <= k <= total_paths]
+            sweep = [k for k in k_values if 2 <= k <= total_utts]
             if not sweep:
-                sweep = list(range(1, total_paths + 1))
+                sweep = list(range(2, k_max + 1))
+
+        print(f"  Sweeping k from {sweep[0]} to {sweep[-1]}")
 
         ff1_scores   = []
         comp_scores  = []
         faith_scores = []
 
         for k in tqdm(sweep, desc=f"  k-sweep [{domain}]"):
-            flow_k = discover_flow_path_pruning(base_info, k=k, name=f"{domain}_k{k}")
-            bd     = ff1_breakdown(dialogues, flow_k)
+            flow_k = discover_flow_kmeans(
+                dialogues, k=k, name=f"{domain}_k{k}"
+            )
+            bd = ff1_breakdown(dialogues, flow_k)
             ff1_scores.append(bd["ff1"])
             comp_scores.append(bd["compactness"])
             faith_scores.append(bd["faithfulness"])
@@ -353,26 +349,24 @@ def run_experiment(
             "faith_scores": faith_scores,
             "best_k":       best_k,
             "best_ff1":     best_ff1,
-            "total_paths":  total_paths,
         }
 
         # Plot
-        ax.plot(sweep, ff1_scores,  "b-o", linewidth=2, markersize=4, label="FF1")
+        ax.plot(sweep, ff1_scores,  "b-o", linewidth=2, markersize=3, label="FF1")
         ax.plot(sweep, comp_scores, "g--", linewidth=1.5, label="Compactness")
         ax.plot(sweep, faith_scores,"r--", linewidth=1.5, label="Faithfulness")
         ax.axvline(best_k, color="navy", linestyle=":", linewidth=1.5,
                    label=f"Optimal k={best_k}")
         ax.scatter([best_k], [best_ff1], color="navy", zorder=5, s=80)
-        title = tasks.get(domain, domain) if tasks else domain
-        ax.set_title(f"{title} — Optimal k={best_k} paths", fontsize=13)
-        ax.set_xlabel("k (number of retained paths)", fontsize=11)
+        ax.set_title(f"{task_label} — Optimal k={best_k} nodes", fontsize=13)
+        ax.set_xlabel("k (number of intent nodes)", fontsize=11)
         ax.set_ylabel("Score", fontsize=11)
         ax.set_ylim(0, 1.05)
         ax.legend(fontsize=9)
         ax.grid(alpha=0.3)
 
     plt.suptitle(
-        "Experiment 2: FF1 Peaks at Optimal k (Path Pruning — Compactness vs Faithfulness)",
+        "Experiment 2: FF1 Peaks at Optimal k (Compactness vs Faithfulness)",
         fontsize=12, y=1.02,
     )
     plt.tight_layout()
@@ -391,14 +385,12 @@ def run_experiment(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Experiment 2: FF1 k-optimisation (path pruning)")
+    parser = argparse.ArgumentParser(description="Experiment 2: FF1 k-optimisation (k-means)")
     parser.add_argument("--domains", nargs="+", default=["banking", "hotel"])
     parser.add_argument("--k-min", type=int, default=None,
-                        help="Minimum k (default: 1)")
+                        help="Minimum k (default: 2)")
     parser.add_argument("--k-max", type=int, default=None,
-                        help="Maximum k (default: number of unique paths found)")
-    parser.add_argument("--n-clusters", type=int, default=N_BASE_CLUSTERS,
-                        help=f"Number of clusters for full DAG (default: {N_BASE_CLUSTERS})")
+                        help="Maximum k (default: auto from corpus size)")
     parser.add_argument("--no-tasks", action="store_true",
                         help="Disable task filtering (use full domain corpus)")
     parser.add_argument("--no-save", action="store_true")
@@ -406,8 +398,8 @@ if __name__ == "__main__":
 
     k_values = None
     if args.k_min is not None or args.k_max is not None:
-        lo = args.k_min or 1
-        hi = args.k_max or 200
+        lo = args.k_min or 2
+        hi = args.k_max or 80
         k_values = list(range(lo, hi + 1))
 
     tasks = {} if args.no_tasks else None  # None → use DEFAULT_TASKS
@@ -416,11 +408,10 @@ if __name__ == "__main__":
         domains=args.domains,
         k_values=k_values,
         tasks=tasks,
-        n_base_clusters=args.n_clusters,
         save_fig=not args.no_save,
     )
 
     print("\n=== Summary ===")
     for domain, r in results.items():
-        print(f"  {domain}: optimal k={r['best_k']} / {r['total_paths']} paths, "
+        print(f"  {domain}: optimal k={r['best_k']} nodes, "
               f"FF1={r['best_ff1']:.3f}")
