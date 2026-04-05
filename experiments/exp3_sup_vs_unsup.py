@@ -167,4 +167,4 @@ if __name__ == "__main__":
         unsup_ff1 = r["unsupervised"]["ff1"]
         better = "Supervised" if sup_ff1 >= unsup_ff1 else "Unsupervised"
         print(f"  {domain}: Supervised FF1={sup_ff1:.3f}, "
-              f"Unsupervised FF1={unsup_ff1:.3f}  → {better} wins")
+              f"Unsupervised FF1={unsup_ff1:.3f}  -> {better} wins")
